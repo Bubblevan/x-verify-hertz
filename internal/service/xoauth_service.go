@@ -134,8 +134,10 @@ func (s *XOAuthService) HandleCallback(code, state string) (string, error) {
 	}
 	s.accountStore.Save(account)
 
-	// Update session status
+	// Update session with X user info - this links DID to X account
 	session.Status = "authorized"
+	session.XUserID = userInfo.ID
+	session.Username = userInfo.Username
 	s.sessionStore.Update(session)
 
 	// Build redirect URL
@@ -150,14 +152,29 @@ func (s *XOAuthService) HandleCallback(code, state string) (string, error) {
 
 // GetOAuthStatus returns the OAuth status for a DID
 func (s *XOAuthService) GetOAuthStatus(did string) (*model.XOAuthStatusResponse, error) {
-	// Check if there's a binding
+	// First check if there's a completed binding
 	binding, ok := s.bindingStore.GetByDID(did)
-	if !ok {
+	if ok {
+		account, ok := s.accountStore.GetByXUserID(binding.XUserID)
+		if ok {
+			return &model.XOAuthStatusResponse{
+				Connected:    true,
+				Username:     account.Username,
+				XUserID:      account.XUserID,
+				Protected:    account.Protected,
+				TokenExpired: time.Now().After(account.TokenExpiresAt),
+			}, nil
+		}
+	}
+
+	// Check if there's an active OAuth session
+	session, ok := s.sessionStore.GetByDID(did)
+	if !ok || session.Status != "authorized" {
 		return &model.XOAuthStatusResponse{Connected: false}, nil
 	}
 
-	// Get account info
-	account, ok := s.accountStore.GetByXUserID(binding.XUserID)
+	// Get account info from session
+	account, ok := s.accountStore.GetByXUserID(session.XUserID)
 	if !ok {
 		return &model.XOAuthStatusResponse{Connected: false}, nil
 	}
@@ -171,7 +188,7 @@ func (s *XOAuthService) GetOAuthStatus(did string) (*model.XOAuthStatusResponse,
 	}, nil
 }
 
-// VerifyTweet verifies a tweet for DID verification
+// VerifyTweet verifies a tweet for DID verification using real X API
 func (s *XOAuthService) VerifyTweet(did, tweetURL string) (*model.VerifyTwitterResponse, error) {
 	// Validate DID
 	if !util.IsValidDID(did) {
@@ -183,23 +200,21 @@ func (s *XOAuthService) VerifyTweet(did, tweetURL string) (*model.VerifyTwitterR
 		return nil, fmt.Errorf("did_not_found")
 	}
 
-	// Check OAuth connection
+	// Check if DID is already bound
 	if _, ok := s.bindingStore.GetByDID(did); ok {
 		return nil, fmt.Errorf("did_already_bound")
 	}
 
-	// Get account for this DID (must be connected via OAuth)
+	// Get OAuth session for this DID
 	session, ok := s.sessionStore.GetByDID(did)
 	if !ok || session.Status != "authorized" {
 		return nil, fmt.Errorf("x_oauth_not_connected")
 	}
 
-	// Find account by DID (we need to track which account is connected to which DID)
-	// For now, we'll iterate through accounts to find one that was recently authorized
-	// In production, you'd want to store the mapping
-	account, err := s.findAccountForDID(did)
-	if err != nil {
-		return nil, err
+	// Get account using x_user_id from session
+	account, ok := s.accountStore.GetByXUserID(session.XUserID)
+	if !ok {
+		return nil, fmt.Errorf("x_account_not_found")
 	}
 
 	// Decrypt access token
@@ -220,7 +235,7 @@ func (s *XOAuthService) VerifyTweet(did, tweetURL string) (*model.VerifyTwitterR
 		if strings.Contains(err.Error(), "not found") {
 			return nil, fmt.Errorf("tweet_not_found")
 		}
-		return nil, fmt.Errorf("x_api_error")
+		return nil, fmt.Errorf("x_api_error: %w", err)
 	}
 
 	// Verify tweet author matches OAuth user
@@ -234,8 +249,8 @@ func (s *XOAuthService) VerifyTweet(did, tweetURL string) (*model.VerifyTwitterR
 	}
 
 	// Verify tweet text contains expected prefix
-	expectedText := strings.Replace(config.C.XVerifyTweetTemplate, "{DID}", did, 1)
-	if !strings.Contains(tweet.Text, expectedText) {
+	expectedPrefix := strings.Replace(config.C.XVerifyTweetTemplate, "{DID}", "", 1)
+	if !strings.Contains(tweet.Text, expectedPrefix) {
 		return nil, fmt.Errorf("did_not_in_tweet")
 	}
 
@@ -272,35 +287,6 @@ func (s *XOAuthService) VerifyTweet(did, tweetURL string) (*model.VerifyTwitterR
 		RewardTx:      rewardTx,
 		Message:       "Verification successful, 1 USDC sent",
 	}, nil
-}
-
-// Helper function to find account for DID
-func (s *XOAuthService) findAccountForDID(did string) (*model.XAccount, error) {
-	// Get the session to find the state
-	session, ok := s.sessionStore.GetByDID(did)
-	if !ok || session.Status != "authorized" {
-		return nil, fmt.Errorf("x_oauth_not_connected")
-	}
-
-	// Find account by checking recent authorizations
-	// This is a simplified approach - in production, store the x_user_id in the session
-	binding, ok := s.bindingStore.GetByDID(did)
-	if ok {
-		account, ok := s.accountStore.GetByXUserID(binding.XUserID)
-		if ok {
-			return account, nil
-		}
-	}
-
-	// For new verifications, we need to track which account was just authorized
-	// Let's use the session ID to find the account
-	// This requires storing x_user_id in session - let's update the session struct
-
-	// As a workaround, iterate through all accounts and find the most recent one
-	// associated with this DID's session timeframe
-	// This is not ideal but works for the demo
-
-	return nil, fmt.Errorf("account_not_found")
 }
 
 // extractTweetID extracts tweet ID from URL

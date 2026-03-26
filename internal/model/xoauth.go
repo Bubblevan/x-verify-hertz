@@ -10,6 +10,8 @@ type XOAuthSession struct {
 	CodeVerifier  string    `json:"code_verifier"`
 	RedirectURI   string    `json:"redirect_uri"`
 	Status        string    `json:"status"` // pending/authorized/expired
+	XUserID       string    `json:"x_user_id"` // set after successful OAuth
+	Username      string    `json:"username"`  // set after successful OAuth
 	CreatedAt     time.Time `json:"created_at"`
 	ExpiresAt     time.Time `json:"expires_at"`
 }

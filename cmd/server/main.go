@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"time"
 
 	"stablepay-x-verify-hertz/internal/config"
@@ -44,18 +45,28 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	// Mock endpoints (for testing without real X API)
-	mux.HandleFunc("/api/v1/mock/did", s.handleMockDID)
-	mux.HandleFunc("/api/v1/mock/twitter/tweets", s.handleMockTweet)
-	mux.HandleFunc("/api/v1/mock/bindings", s.handleGetBindings)
-	mux.HandleFunc("/api/v1/verify/twitter", s.handleVerify) // Legacy mock verify
+	// Static files (verify page)
+	mux.HandleFunc("/verify", s.handleVerifyPage)
+	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("./web"))))
 
-	// Real X OAuth endpoints
+	// API endpoints per minimal chain spec
+	// DID endpoints
+	mux.HandleFunc("/api/v1/did", s.handleCreateDID)
+
+	// Real X OAuth endpoints (per minimal chain spec)
 	mux.HandleFunc("/api/v1/x/oauth/start", s.handleXOAuthStart)
 	mux.HandleFunc("/api/v1/x/oauth/callback", s.handleXOAuthCallback)
 	mux.HandleFunc("/api/v1/x/oauth/status", s.handleXOAuthStatus)
-	mux.HandleFunc("/api/v1/x/verify-twitter", s.handleXVerifyTwitter) // Real verify
-	mux.HandleFunc("/api/v1/verify", s.handleGetVerifyStatus)
+
+	// Verification endpoints (per minimal chain spec)
+	mux.HandleFunc("/api/v1/verify-twitter", s.handleVerifyTwitter) // Real X API verify
+	mux.HandleFunc("/api/v1/verify", s.handleGetVerifyStatus)       // Check verification status
+
+	// Legacy mock endpoints (for development/testing)
+	mux.HandleFunc("/api/v1/mock/did", s.handleMockDID)
+	mux.HandleFunc("/api/v1/mock/twitter/tweets", s.handleMockTweet)
+	mux.HandleFunc("/api/v1/mock/bindings", s.handleGetBindings)
+	mux.HandleFunc("/api/v1/verify/twitter", s.handleMockVerify) // Legacy mock verify
 
 	handler := corsMiddleware(mux)
 
@@ -65,6 +76,7 @@ func main() {
 	log.Printf("  - X Client ID: %s...", truncate(config.C.XClientID, 10))
 	log.Printf("  - Frontend URL: %s", config.C.FrontendVerifyURL)
 	log.Printf("  - OAuth Callback: %s", config.C.XRedirectURI)
+	log.Printf("  - Verify page: http://localhost:%s/verify?did=...", port)
 	log.Fatal(http.ListenAndServe(":"+port, handler))
 }
 
@@ -90,29 +102,49 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// Legacy mock verify endpoint
-func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
+// handleVerifyPage serves the verify.html page with DID parameter
+func (s *Server) handleVerifyPage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Serve the verify.html file
+	http.ServeFile(w, r, "./web/verify.html")
+}
+
+// handleCreateDID creates a new DID (per minimal chain spec)
+func (s *Server) handleCreateDID(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	var req model.VerifyTwitterRequest
+	var req struct {
+		DID           string `json:"did"`
+		WalletAddress string `json:"wallet_address"`
+	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", "invalid json")
 		return
 	}
 
-	resp, errResp := s.verifySvc.Verify(req)
-	if errResp != nil {
-		writeError(w, http.StatusBadRequest, errResp.Code, errResp.Message)
+	if !util.IsValidDID(req.DID) {
+		writeError(w, http.StatusBadRequest, "invalid_did", "did format invalid")
 		return
 	}
 
-	writeJSON(w, http.StatusOK, resp)
+	didIdentity := model.DIDIdentity{
+		DID:           req.DID,
+		WalletAddress: req.WalletAddress,
+		CreatedAt:     time.Now().UTC(),
+	}
+	s.didStore.Save(didIdentity)
+
+	writeJSON(w, http.StatusOK, didIdentity)
 }
 
-// X OAuth Start - initiates OAuth flow
+// X OAuth Start - initiates OAuth flow (per minimal chain spec)
 func (s *Server) handleXOAuthStart(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -134,7 +166,7 @@ func (s *Server) handleXOAuthStart(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// X OAuth Callback - handles OAuth callback from X
+// X OAuth Callback - handles OAuth callback from X (per minimal chain spec)
 func (s *Server) handleXOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -149,7 +181,7 @@ func (s *Server) handleXOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		// Handle OAuth error from X
 		redirectURL := fmt.Sprintf("%s?oauth=failed&reason=%s",
 			config.C.FrontendVerifyURL,
-			errorMsg,
+			url.QueryEscape(errorMsg),
 		)
 		http.Redirect(w, r, redirectURL, http.StatusTemporaryRedirect)
 		return
@@ -167,7 +199,7 @@ func (s *Server) handleXOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		errorRedirect := fmt.Sprintf("%s?oauth=failed&reason=%s",
 			config.C.FrontendVerifyURL,
-			err.Error(),
+			url.QueryEscape(err.Error()),
 		)
 		http.Redirect(w, r, errorRedirect, http.StatusTemporaryRedirect)
 		return
@@ -176,7 +208,7 @@ func (s *Server) handleXOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, redirectURL, http.StatusTemporaryRedirect)
 }
 
-// X OAuth Status - checks if DID is connected to X
+// X OAuth Status - checks if DID is connected to X (per minimal chain spec)
 func (s *Server) handleXOAuthStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -198,8 +230,8 @@ func (s *Server) handleXOAuthStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, status)
 }
 
-// X Verify Twitter - real verification using X API
-func (s *Server) handleXVerifyTwitter(w http.ResponseWriter, r *http.Request) {
+// handleVerifyTwitter - real verification using X API (per minimal chain spec)
+func (s *Server) handleVerifyTwitter(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -214,20 +246,34 @@ func (s *Server) handleXVerifyTwitter(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// TODO: Implement real X API verify
-	// For now, return error indicating this needs X API credentials
+	// Check if X API is configured
 	if config.C.XClientID == "" {
 		writeError(w, http.StatusServiceUnavailable, "x_api_not_configured",
 			"X API not configured. Set X_CLIENT_ID and X_CLIENT_SECRET environment variables.")
 		return
 	}
 
-	// Placeholder: call the real verification service
-	writeError(w, http.StatusNotImplemented, "not_implemented",
-		"Real X API verification is being implemented. Please check your X API credentials first.")
+	// Call real X API verification
+	resp, err := s.xOAuthSvc.VerifyTweet(req.DID, req.TweetURL)
+	if err != nil {
+		// Map error to appropriate error code
+		errCode := err.Error()
+		switch errCode {
+		case "invalid_did", "did_not_found", "x_oauth_not_connected",
+			"invalid_tweet_url", "tweet_not_found", "tweet_author_mismatch",
+			"did_not_in_tweet", "twitter_account_protected",
+			"did_already_bound", "twitter_already_bound":
+			writeError(w, http.StatusBadRequest, errCode, errCode)
+		default:
+			writeError(w, http.StatusInternalServerError, "verification_failed", err.Error())
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, resp)
 }
 
-// Get Verify Status - checks verification status for a DID
+// handleGetVerifyStatus - checks verification status for a DID (per minimal chain spec)
 func (s *Server) handleGetVerifyStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -240,21 +286,22 @@ func (s *Server) handleGetVerifyStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check mock binding first
-	if binding, ok := s.bindingStore.GetByDID(did); ok {
+	// Check real X binding first
+	if binding, ok := s.xBindingStore.GetByDID(did); ok {
+		username := "@" + binding.Username
 		writeJSON(w, http.StatusOK, model.VerifyStatusResponse{
 			Verified:      true,
-			TwitterHandle: &binding.TwitterHandle,
+			TwitterHandle: &username,
 			RewardTx:      &binding.RewardTx,
 		})
 		return
 	}
 
-	// Check real X binding
-	if binding, ok := s.xBindingStore.GetByDID(did); ok {
+	// Check legacy mock binding
+	if binding, ok := s.bindingStore.GetByDID(did); ok {
 		writeJSON(w, http.StatusOK, model.VerifyStatusResponse{
 			Verified:      true,
-			TwitterHandle: &binding.Username,
+			TwitterHandle: &binding.TwitterHandle,
 			RewardTx:      &binding.RewardTx,
 		})
 		return
@@ -265,7 +312,8 @@ func (s *Server) handleGetVerifyStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Legacy mock endpoints
+// Legacy mock endpoints (for development/testing)
+
 func (s *Server) handleMockDID(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -353,6 +401,27 @@ func (s *Server) handleGetBindings(w http.ResponseWriter, r *http.Request) {
 
 	bindings := s.bindingStore.List()
 	writeJSON(w, http.StatusOK, bindings)
+}
+
+func (s *Server) handleMockVerify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req model.VerifyTwitterRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "invalid json")
+		return
+	}
+
+	resp, errResp := s.verifySvc.Verify(req)
+	if errResp != nil {
+		writeError(w, http.StatusBadRequest, errResp.Code, errResp.Message)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
