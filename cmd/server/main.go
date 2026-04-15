@@ -16,15 +16,16 @@ import (
 )
 
 type Server struct {
-	verifySvc     *service.VerifyTwitterService
-	xOAuthSvc     *service.XOAuthService
-	didStore      *store.DIDStore
-	tweetStore    *store.TweetStore
-	bindingStore  *store.BindingStore
-	rewardStore   *store.RewardStore
-	xSessionStore *store.XOAuthSessionStore
-	xAccountStore *store.XAccountStore
-	xBindingStore *store.XBindingStore
+	verifySvc      *service.VerifyTwitterService
+	xOAuthSvc      *service.XOAuthService
+	realVerifySvc  *service.RealVerifyService
+	didStore       *store.DIDStore
+	tweetStore     *store.TweetStore
+	bindingStore   *store.BindingStore
+	rewardStore    *store.RewardStore
+	xSessionStore  *store.XOAuthSessionStore
+	xAccountStore  *store.XAccountStore
+	xBindingStore  *store.XBindingStore
 }
 
 func main() {
@@ -42,6 +43,7 @@ func main() {
 	}
 	s.verifySvc = service.NewVerifyTwitterService(s.didStore, s.tweetStore, s.bindingStore, s.rewardStore)
 	s.xOAuthSvc = service.NewXOAuthService(s.xSessionStore, s.xAccountStore, s.xBindingStore, s.didStore)
+	s.realVerifySvc = service.NewRealVerifyService(s.didStore, s.bindingStore, s.rewardStore, s.xBindingStore)
 
 	mux := http.NewServeMux()
 
@@ -53,12 +55,12 @@ func main() {
 	// DID endpoints
 	mux.HandleFunc("/api/v1/did", s.handleCreateDID)
 
-	// Real X OAuth endpoints (per minimal chain spec)
+	// Real X OAuth endpoints (per minimal chain spec) - kept for backward compatibility
 	mux.HandleFunc("/api/v1/x/oauth/start", s.handleXOAuthStart)
 	mux.HandleFunc("/api/v1/x/oauth/callback", s.handleXOAuthCallback)
 	mux.HandleFunc("/api/v1/x/oauth/status", s.handleXOAuthStatus)
 
-	// Verification endpoints (per minimal chain spec)
+	// Verification endpoints (MVP - using real X API read-only)
 	mux.HandleFunc("/api/v1/verify-twitter", s.handleVerifyTwitter) // Real X API verify
 	mux.HandleFunc("/api/v1/verify", s.handleGetVerifyStatus)       // Check verification status
 
@@ -73,9 +75,15 @@ func main() {
 	port := config.C.Port
 	log.Printf("stablepay x verify listening on :%s", port)
 	log.Printf("Configuration:")
-	log.Printf("  - X Client ID: %s...", truncate(config.C.XClientID, 10))
+	log.Printf("  - X API Base URL: %s", config.C.XAPIBaseURL)
+	if config.C.XBearerToken != "" {
+		log.Printf("  - Auth Method: Bearer Token (preferred)")
+	} else if config.C.XConsumerKey != "" {
+		log.Printf("  - Auth Method: OAuth 1.0a")
+	} else {
+		log.Printf("  - WARNING: No X API credentials configured")
+	}
 	log.Printf("  - Frontend URL: %s", config.C.FrontendVerifyURL)
-	log.Printf("  - OAuth Callback: %s", config.C.XRedirectURI)
 	log.Printf("  - Verify page: http://localhost:%s/verify?did=...", port)
 	log.Fatal(http.ListenAndServe(":"+port, handler))
 }
@@ -144,7 +152,7 @@ func (s *Server) handleCreateDID(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, didIdentity)
 }
 
-// X OAuth Start - initiates OAuth flow (per minimal chain spec)
+// X OAuth Start - initiates OAuth flow (kept for backward compatibility)
 func (s *Server) handleXOAuthStart(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -166,7 +174,7 @@ func (s *Server) handleXOAuthStart(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// X OAuth Callback - handles OAuth callback from X (per minimal chain spec)
+// X OAuth Callback - handles OAuth callback from X (kept for backward compatibility)
 func (s *Server) handleXOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -208,7 +216,7 @@ func (s *Server) handleXOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, redirectURL, http.StatusTemporaryRedirect)
 }
 
-// X OAuth Status - checks if DID is connected to X (per minimal chain spec)
+// X OAuth Status - checks if DID is connected to X (kept for backward compatibility)
 func (s *Server) handleXOAuthStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -230,7 +238,8 @@ func (s *Server) handleXOAuthStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, status)
 }
 
-// handleVerifyTwitter - real verification using X API (per minimal chain spec)
+// handleVerifyTwitter - real verification using X API (MVP version)
+// This uses Bearer Token or OAuth 1.0a to read tweets directly, without OAuth callback flow
 func (s *Server) handleVerifyTwitter(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -247,23 +256,43 @@ func (s *Server) handleVerifyTwitter(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check if X API is configured
-	if config.C.XClientID == "" {
+	if config.C.XBearerToken == "" && config.C.XConsumerKey == "" {
 		writeError(w, http.StatusServiceUnavailable, "x_api_not_configured",
-			"X API not configured. Set X_CLIENT_ID and X_CLIENT_SECRET environment variables.")
+			"X API not configured. Set X_BEARER_TOKEN or X_CONSUMER_KEY/X_ACCESS_TOKEN environment variables.")
 		return
 	}
 
-	// Call real X API verification
-	resp, err := s.xOAuthSvc.VerifyTweet(req.DID, req.TweetURL)
+	// Call real X API verification using read-only access
+	resp, err := s.realVerifySvc.Verify(service.VerifyRequest{
+		DID:      req.DID,
+		TweetURL: req.TweetURL,
+	})
 	if err != nil {
 		// Map error to appropriate error code
-		errCode := err.Error()
-		switch errCode {
-		case "invalid_did", "did_not_found", "x_oauth_not_connected",
-			"invalid_tweet_url", "tweet_not_found", "tweet_author_mismatch",
-			"did_not_in_tweet", "twitter_account_protected",
-			"did_already_bound", "twitter_already_bound":
-			writeError(w, http.StatusBadRequest, errCode, errCode)
+		errStr := err.Error()
+		switch {
+		case contains(errStr, "invalid_did"):
+			writeError(w, http.StatusBadRequest, "invalid_did", "DID format is invalid")
+		case contains(errStr, "did_not_found"):
+			writeError(w, http.StatusBadRequest, "did_not_found", "DID not found, create wallet first")
+		case contains(errStr, "invalid_tweet_url"):
+			writeError(w, http.StatusBadRequest, "invalid_tweet_url", "Invalid tweet URL format")
+		case contains(errStr, "tweet_not_found"):
+			writeError(w, http.StatusBadRequest, "tweet_not_found", "Tweet not found or not accessible")
+		case contains(errStr, "tweet_author_mismatch"):
+			writeError(w, http.StatusBadRequest, "tweet_author_mismatch", "Tweet author does not match URL")
+		case contains(errStr, "did_not_in_tweet"):
+			writeError(w, http.StatusBadRequest, "did_not_in_tweet", "Tweet does not contain the DID")
+		case contains(errStr, "invalid_tweet_content"):
+			writeError(w, http.StatusBadRequest, "invalid_tweet_content", "Tweet does not contain required verification prefix")
+		case contains(errStr, "twitter_account_protected"):
+			writeError(w, http.StatusBadRequest, "twitter_account_protected", "Twitter account is protected (private)")
+		case contains(errStr, "did_already_bound"):
+			writeError(w, http.StatusBadRequest, "did_already_bound", "DID already bound to another Twitter account")
+		case contains(errStr, "twitter_already_bound"):
+			writeError(w, http.StatusBadRequest, "twitter_already_bound", "Twitter account already bound to another DID")
+		case contains(errStr, "x_api_error"):
+			writeError(w, http.StatusInternalServerError, "x_api_error", "X API request failed: "+errStr)
 		default:
 			writeError(w, http.StatusInternalServerError, "verification_failed", err.Error())
 		}
@@ -273,7 +302,21 @@ func (s *Server) handleVerifyTwitter(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// handleGetVerifyStatus - checks verification status for a DID (per minimal chain spec)
+// Helper function to check if string contains substring
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsHelper(s, substr))
+}
+
+func containsHelper(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}
+
+// handleGetVerifyStatus - checks verification status for a DID
 func (s *Server) handleGetVerifyStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -286,30 +329,13 @@ func (s *Server) handleGetVerifyStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check real X binding first
-	if binding, ok := s.xBindingStore.GetByDID(did); ok {
-		username := "@" + binding.Username
-		writeJSON(w, http.StatusOK, model.VerifyStatusResponse{
-			Verified:      true,
-			TwitterHandle: &username,
-			RewardTx:      &binding.RewardTx,
-		})
+	status, err := s.realVerifySvc.GetVerifyStatus(did)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), err.Error())
 		return
 	}
 
-	// Check legacy mock binding
-	if binding, ok := s.bindingStore.GetByDID(did); ok {
-		writeJSON(w, http.StatusOK, model.VerifyStatusResponse{
-			Verified:      true,
-			TwitterHandle: &binding.TwitterHandle,
-			RewardTx:      &binding.RewardTx,
-		})
-		return
-	}
-
-	writeJSON(w, http.StatusOK, model.VerifyStatusResponse{
-		Verified: false,
-	})
+	writeJSON(w, http.StatusOK, status)
 }
 
 // Legacy mock endpoints (for development/testing)

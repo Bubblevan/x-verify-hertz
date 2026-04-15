@@ -229,8 +229,8 @@ func (s *XOAuthService) VerifyTweet(did, tweetURL string) (*model.VerifyTwitterR
 		return nil, fmt.Errorf("invalid_tweet_url")
 	}
 
-	// Fetch tweet from X API
-	tweet, author, err := s.xClient.GetTweetByID(tweetID, accessToken)
+	// Fetch tweet from X API using OAuth 2.0 token
+	tweet, author, err := s.xClient.GetTweetByIDWithToken(tweetID, accessToken)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			return nil, fmt.Errorf("tweet_not_found")
